@@ -1,0 +1,123 @@
+* magiku: make + git + systemd ~= heroku
+I like my server and and app deployment configuration to be in version control and separate from the apps itself.
+While there's tons of existing solutions for that I wanted something that has little unnecesary additional complexity.
+I have a single server and my requirements for configuration and deployment process are quite simple.
+The usual suspects for config management / deployment are overkill for that.
+magiku is just a little glue connecting =git=, =make= & =systemd=.
+Those tools are part of my development environment anyways and don't add any complexity that I don't have to deal with anyways.
+
+- =git= is used for version control and deployment. a post-receive hook runs =make= on push
+- =make= is used to define workflows and run them only when necessary
+- =systemd= is used to run the actual services, timers etc and takes care of security / isolation
+
+Read through [[https://github.com/niklasfasching/magiku/blob/master/Makefile][the Makefile]] and check out the [[https://github.com/niklasfasching/magiku#examples][examples]] below - it's quite simple
+- Symlink =general= configuration files - e.g. ssh =authorized_keys= and =gitconfig=
+- =gitconfig= sets up a =post-push= hook for all repositories that runs =~/config make=
+  - an app push builds and restarts all apps that changed (i.e. only the pushed app) via =make install=
+  - a config push additionally clones apps and configures the server beforehand via =make init install=
+* usage
+** fork
+1. Fork this repo and set up [[https://git-scm.com/book/en/v2/Git-Tools-Rerere][git rerere]]
+2. Add your [[https://docs.github.com/en/github/authenticating-to-github/generating-a-new-ssh-key-and-adding-it-to-the-ssh-agent][ssh key]] to =general/authorized_keys=
+3. (optional: if you want to clone github repos in make init) [[https://docs.github.com/en/developers/overview/using-ssh-agent-forwarding][Set up ssh agent forwarding]] for your server
+** init
+1. install ubuntu on your server
+2. =ssh root@server= and =git clone= your fork into =~/config=
+   - if you didn't permanently set up agent forwarding for your server you might want connect with =ssh -A= to allow cloning your fork from github this once
+3. =cd ~/config && make init install=
+** deploy
+To add a module
+1. add a subdirectory in the fork of this repo with a Makefile with init and install targets
+2. (optional: if you don't create the repo in make init) create a repo in =~/= - e.g. =mkdir blog && cd blog && git init=
+3. push
+   - pushing the config repo runs make init install
+   - pushing your app repo runs make install
+* examples
+** http server
+#+begin_src bash
+$ ls ~/config/serve
+-rw-rw-r-- 1 niklas niklas 1,6K Aug 22 17:57 config.json
+-rw-rw-r-- 1 niklas niklas  452 Aug 28 22:21 Makefile
+-rw-rw-r-- 1 niklas niklas  595 Aug 22 17:57 serve.service
+#+end_src
+
+#+begin_src Makefile
+.PHONY: init
+init:
+	snap install go --classic
+
+install: /usr/local/lib/systemd/system/serve.service config.json /usr/local/bin/serve
+	systemctl daemon-reload
+	systemctl restart serve
+	touch install
+
+/usr/local/lib/systemd/system/serve.service:
+	ln --force --symbolic ~/config/serve/serve.service /usr/local/lib/systemd/system/serve.service
+
+/usr/local/bin/serve:
+	go get -u github.com/niklasfasching/serve
+	go build -o /usr/local/bin/serve ~/go/src/github.com/niklasfasching/serve/cmd/serve/main.go
+#+end_src
+
+#+begin_src systemd
+[Unit]
+Description=http server
+Documentation=https://github.com/niklasfasching/serve
+After=network-online.target
+
+[Service]
+Restart=always
+DynamicUser=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ExecStart=/usr/local/bin/serve /etc/serve/config.json
+
+LogsDirectory=serve
+StateDirectory=serve
+ConfigurationDirectory=serve
+
+BindPaths=/root/config/serve/config.json:/etc/serve/config.json
+
+[Install]
+WantedBy=multi-user.target
+#+end_src
+** fetch github repo in =make init=
+- git clone requires ssh keys (i.e. =ssh -A [...]=. =git push= will error unless you edit your ssh config to always forward the agent for your server)
+as the =~/blog= target only runs once and we run
+#+begin_src Makefile
+.PHONY: init
+init: ~/blog
+
+~/blog:
+	git clone git@github.com:user/blog.git ~/blog
+#+end_src
+* ideas
+- [ ] fail git push on error
+  - pre-receive hook can fail the push. this requires [[https://github.com/dokku/dokku/issues/2796][fiddling with the git environment]]
+  - =systemctl {start,restart}= does not block/fail for simple services. requires support by the app (e.g. [[https://www.freedesktop.org/software/systemd/man/systemd-notify.html][sd_notify]])
+- [ ] user management (e.g. allow deploy-only rights for a specific app)
+- [ ] non-root user: passwordless sudo using pam ssh agent auth
+* reasoning
+- app deployment configuration separate from the app repo
+  - a lot of my code is open source and must not include secrets
+  - running different configurations requires separation - open source means there might be use for other configurations than mine
+- root
+  - we need passwordless sudo for =git push= deploys. we can either use the =root= user or set up passwordless sudo in =sudoers=
+  - systemd [[http://0pointer.net/blog/dynamic-users-with-systemd.html][DynamicUser]] and [[https://www.freedesktop.org/software/systemd/man/systemd.exec.html#AmbientCapabilities=][AmbientCapabilities]] allow us to isolate apps - no need for different users on the actual system
+  - setting up another user with passwordless sudo is more work and doesn't add any security - passwordless sudo can merely prevent accidents
+  - we're only running hobby projects - if something goes wrong that's a learning experience. maybe it'll teach me not to use the root user
+- git is designed with timestamp based build tools in mind
+  - modification times are not committed. files are touched whenever they are change (e.g. checkout)
+  - the =.git= directory mtime changes with checkout. we can depend on it as a proxy for any changes in the repo
+- systemd system instance rather than user instance
+  - user instances don't require sudo - but they also don't support all options - e.g. RootImage
+  - we probably want sudo anyways - e.g. for building inside a container using =systemd-nspawn=
+** symlink systemd files
+- we want to remove / stop services when apps are removed from the config repo
+  - we also want to clean up state files and the repo - but stopping the service is more important. disk space is cheap.
+- symlinks allow us to identify files from removed apps - they are broken
+  - make sadly doesn't use the mtime from the symlink but from it's target. there's no way to change that
+    - hardlinks can also be identified easily (=find -links n=) but don't work either because all links share an mtime
+  - this means we can't use the symlink mtime to track when the service has to be restarted
+    - if we depend on the symlink target file the make target is rerun each time (dependency mtime is >= target)
+    - if we don't depend on the symlink target file the make target is not rerun / the service not restarted when that file changes
+  - solution: use a token file that marks the last restart time of the service (=touch install=)

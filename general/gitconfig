@@ -1,0 +1,9 @@
+[user]
+    name = server
+[receive]
+    denyCurrentBranch = updateInstead
+[core]
+    hooksPath = ~/config/general/githooks
+    excludesfile = ~/config/general/gitignore
+[advice]
+    detachedHead = false

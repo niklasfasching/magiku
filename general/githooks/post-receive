@@ -1,0 +1,7 @@
+#!/bin/bash
+
+if [[ "$PWD" -ef ~/config/.git ]]; then
+    (cd ~/config && sudo make init install)
+else
+    (cd ~/config && sudo make install)
+fi
